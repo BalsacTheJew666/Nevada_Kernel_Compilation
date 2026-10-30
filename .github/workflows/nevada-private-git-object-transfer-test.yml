@@ -1,0 +1,92 @@
+name: Nevada Private Git Object Transfer Test
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  transfer-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Verify private repository transfer
+        env:
+          PRIVATE_TOKEN: ${{ secrets.PRIVATE_REPO_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "$PRIVATE_TOKEN" ]; then
+            echo "::error::PRIVATE_REPO_TOKEN secret is missing."
+            exit 1
+          fi
+
+          python3 <<'PY'
+          import os
+          import json
+          import base64
+          import hashlib
+          import urllib.request
+
+          owner = "BalsacTheJew666"
+          repo = "nevada-nethunter-baseline-xt2615"
+          token = os.environ["PRIVATE_TOKEN"]
+
+          payload = (
+              b"NEVADA PRIVATE TRANSFER TEST\n"
+              b"Synthetic test data only.\n"
+              b"No kernel source or private configuration.\n"
+          )
+
+          expected_hash = hashlib.sha256(payload).hexdigest()
+          encoded = base64.b64encode(payload).decode("ascii")
+
+          base = f"https://api.github.com/repos/{owner}/{repo}/git/blobs"
+
+          def request(url, method="GET", data=None):
+              body = None if data is None else json.dumps(data).encode()
+              req = urllib.request.Request(
+                  url,
+                  data=body,
+                  method=method,
+                  headers={
+                      "Authorization": f"Bearer {token}",
+                      "Accept": "application/vnd.github+json",
+                      "X-GitHub-Api-Version": "2022-11-28",
+                      "Content-Type": "application/json",
+                      "User-Agent": "Nevada-Transfer-Test"
+                  }
+              )
+              with urllib.request.urlopen(req, timeout=30) as response:
+                  return json.loads(response.read())
+
+          print("Creating synthetic Git object in private repository...")
+          created = request(base, "POST", {
+              "content": encoded,
+              "encoding": "base64"
+          })
+
+          blob_sha = created["sha"]
+          print("Private Git object created.")
+          print("Blob SHA:", blob_sha)
+
+          print("Retrieving the same object...")
+          retrieved = request(base + "/" + blob_sha)
+
+          if retrieved.get("encoding") != "base64":
+              raise RuntimeError("Unexpected returned encoding.")
+
+          actual = base64.b64decode(retrieved["content"])
+          actual_hash = hashlib.sha256(actual).hexdigest()
+
+          print("Expected SHA-256:", expected_hash)
+          print("Retrieved SHA-256:", actual_hash)
+
+          if actual != payload or actual_hash != expected_hash:
+              raise RuntimeError("Transfer verification failed.")
+
+          print("PASS: Private Git object round-trip verified.")
+          print("No commit or branch reference was created.")
+          PY
