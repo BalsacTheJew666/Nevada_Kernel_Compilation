@@ -1,0 +1,65 @@
+name: Nevada private write-permission probe (no changes)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nevada-private-write-probe
+  cancel-in-progress: false
+
+jobs:
+  verify-private-write-permission:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Verify private repository write authorization without creating a file
+        shell: bash
+        env:
+          PRIVATE_REPO_TOKEN: ${{ secrets.PRIVATE_REPO_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${PRIVATE_REPO_TOKEN:-}" ]; then
+            echo "::error::PRIVATE_REPO_TOKEN is missing or unavailable."
+            exit 1
+          fi
+
+          API="https://api.github.com"
+          REPO="BalsacTheJew666/nevada-nethunter-baseline-xt2615"
+          PROBE_PATH=".github/nevada-write-permission-probe-do-not-create.txt"
+          BODY="$(mktemp)"
+          trap 'rm -f "$BODY"' EXIT
+
+          # An intentionally incomplete PUT body must be rejected by GitHub
+          # validation (HTTP 422). It contains no message or file content,
+          # so GitHub cannot create or modify a repository file.
+          status="$(curl --silent --show-error --location \
+            --request PUT \
+            --output "$BODY" --write-out '%{http_code}' \
+            --header "Accept: application/vnd.github+json" \
+            --header "Authorization: Bearer $PRIVATE_REPO_TOKEN" \
+            --header "X-GitHub-Api-Version: 2022-11-28" \
+            --header "Content-Type: application/json" \
+            --data '{}' \
+            "$API/repos/$REPO/contents/$PROBE_PATH")"
+
+          case "$status" in
+            422)
+              echo "GitHub accepted the authenticated contents-write request for validation."
+              echo "The intentionally incomplete request was rejected; no file was created."
+              echo "PRIVATE CONTENTS-WRITE PERMISSION PROBE PASS."
+              ;;
+            401|403)
+              echo "::error::Token lacks required write authorization or is not authorized (HTTP $status)."
+              exit 1
+              ;;
+            *)
+              echo "::error::Unexpected response from safe no-change write probe (HTTP $status)."
+              cat "$BODY"
+              exit 1
+              ;;
+          esac
+
+          echo "No checkout, build, artifact upload, or repository modification performed."
