@@ -1,0 +1,111 @@
+name: Nevada Private Release Artifact Test
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  private-release-roundtrip:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Create, upload, and verify synthetic private ZIP
+        env:
+          PRIVATE_TOKEN: ${{ secrets.PRIVATE_REPO_TOKEN }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+          GITHUB_RUN_ATTEMPT: ${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          python3 <<'PY'
+          import os, io, json, time, hashlib, zipfile, urllib.request, urllib.parse
+
+          owner = "BalsacTheJew666"
+          repo = "nevada-nethunter-baseline-xt2615"
+          branch = "feature/nethunter-staging"
+          token = os.environ["PRIVATE_TOKEN"]
+          if not token:
+              raise SystemExit("PRIVATE_REPO_TOKEN secret is missing")
+
+          run_id = os.environ["GITHUB_RUN_ID"]
+          attempt = os.environ["GITHUB_RUN_ATTEMPT"]
+          tag = f"nevada-private-artifact-test-{run_id}-{attempt}"
+          asset_name = "nevada-private-storage-probe.zip"
+
+          manifest = (
+              "NEVADA PRIVATE ARTIFACT STORAGE TEST\n"
+              "Synthetic test data only.\n"
+              "No kernel source, binaries, credentials, or private configuration.\n"
+          ).encode()
+
+          memory = io.BytesIO()
+          with zipfile.ZipFile(memory, "w", zipfile.ZIP_DEFLATED) as z:
+              z.writestr("TEST-MANIFEST.txt", manifest)
+              z.writestr("checksums/manifest.sha256",
+                         hashlib.sha256(manifest).hexdigest() + "  TEST-MANIFEST.txt\n")
+          payload = memory.getvalue()
+          expected = hashlib.sha256(payload).hexdigest()
+
+          def request(url, method="GET", data=None, headers=None, raw=False):
+              h = {
+                  "Authorization": f"Bearer {token}",
+                  "Accept": "application/vnd.github+json",
+                  "X-GitHub-Api-Version": "2022-11-28",
+                  "User-Agent": "Nevada-Private-Artifact-Test",
+              }
+              if headers:
+                  h.update(headers)
+              body = data
+              req = urllib.request.Request(url, data=body, method=method, headers=h)
+              with urllib.request.urlopen(req, timeout=45) as response:
+                  content = response.read()
+                  return content if raw else json.loads(content) if content else {}
+
+          api = f"https://api.github.com/repos/{owner}/{repo}"
+          print("Creating private draft release and temporary tag:", tag)
+          release = request(api + "/releases", "POST", json.dumps({
+              "tag_name": tag,
+              "target_commitish": branch,
+              "name": "PRIVATE TEST - synthetic artifact storage",
+              "body": "Temporary private storage validation. Synthetic ZIP only; no kernel outputs.",
+              "draft": True,
+              "prerelease": True
+          }).encode(), {"Content-Type": "application/json"})
+
+          release_id = release["id"]
+          upload_url = release["upload_url"].split("{", 1)[0]
+          upload_url += "?" + urllib.parse.urlencode({"name": asset_name})
+          print("Draft release created:", release_id)
+
+          print("Uploading synthetic ZIP...")
+          asset = request(upload_url, "POST", payload, {
+              "Content-Type": "application/zip",
+              "Accept": "application/vnd.github+json"
+          })
+
+          asset_id = asset["id"]
+          asset_url = asset["url"]
+          print("Private release asset created:", asset_id)
+
+          print("Downloading uploaded asset for independent verification...")
+          downloaded = request(asset_url, "GET", headers={
+              "Accept": "application/octet-stream"
+          }, raw=True)
+
+          actual = hashlib.sha256(downloaded).hexdigest()
+          print("Expected ZIP SHA-256:", expected)
+          print("Downloaded ZIP SHA-256:", actual)
+          if downloaded != payload or actual != expected:
+              raise RuntimeError("Private release asset round-trip verification failed.")
+
+          with zipfile.ZipFile(io.BytesIO(downloaded)) as z:
+              if z.testzip() is not None or "TEST-MANIFEST.txt" not in z.namelist():
+                  raise RuntimeError("Downloaded ZIP integrity check failed.")
+
+          print("PASS: Synthetic ZIP uploaded and retrieved byte-for-byte.")
+          print("Draft release retained privately for inspection.")
+          print("Release ID:", release_id)
+          print("Asset ID:", asset_id)
+          print("Tag:", tag)
+          PY
