@@ -1,0 +1,81 @@
+name: Build Nevada Kernel with NetHunter & SUSFS
+
+on:
+  workflow_dispatch:   # Allows manual trigger from the Actions tab
+  push:
+    branches: [ main ]
+
+jobs:
+  build-kernel:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout Kernel Source
+        uses: actions/checkout@v4
+        with:
+          repository: MotorolaMobilityLLC/kernel-mtk
+          ref: android-16-release-w1wn36.18-114   # Branch for Nevada / MT6835[reference:3]
+          path: kernel
+          fetch-depth: 1
+
+      - name: Set up build environment
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y git curl bc bison build-essential flex \
+            libssl-dev libelf-dev python3 zip
+          # Install AOSP Clang (r487747c – adjust if needed for your kernel)
+          git clone --depth=1 https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86 -b main /tmp/clang
+          export PATH=/tmp/clang/clang-r487747c/bin:$PATH
+          echo "PATH=/tmp/clang/clang-r487747c/bin:$PATH" >> $GITHUB_ENV
+
+      - name: Apply Kali NetHunter Patches
+        run: |
+          cd kernel
+          # Clone the official NetHunter kernel patch set
+          git clone --depth=1 https://gitlab.com/kalilinux/nethunter/build-scripts/kali-nethunter-kernel.git /tmp/nethunter-patches
+          # Apply patches (order matters – adjust if you have a specific patch list)
+          for p in /tmp/nethunter-patches/*.patch; do
+            echo "Applying $p"
+            git am "$p" || git apply "$p"   # fallback to apply if am fails
+          done
+
+      - name: Apply SUSFS Patches
+        run: |
+          cd kernel
+          # Clone the SUSFS patch repository (WildKernels maintains a common set)
+          git clone --depth=1 https://github.com/WildKernels/kernel_patches.git /tmp/susfs-patches
+          # Apply the SUSFS patches (adjust the path to the correct version for your kernel)
+          # Example: /tmp/susfs-patches/susfs/v2.0.0/*.patch
+          SUSFS_DIR="/tmp/susfs-patches/susfs/v2.0.0"   # <-- CHANGE to the version you need
+          if [ -d "$SUSFS_DIR" ]; then
+            for p in "$SUSFS_DIR"/*.patch; do
+              echo "Applying SUSFS patch $p"
+              git apply "$p" || git am "$p"
+            done
+          else
+            echo "SUSFS patch directory $SUSFS_DIR not found – please update the path."
+            exit 1
+          fi
+
+      - name: Configure Kernel
+        run: |
+          cd kernel
+          # The defconfig for Nevada is likely nevada_defconfig or mt6835_defconfig.
+          # Check arch/arm64/configs/ in the kernel tree to confirm.
+          make ARCH=arm64 nevada_defconfig   # <-- VERIFY the defconfig name
+          # (If the above fails, try: make ARCH=arm64 mt6835_defconfig)
+
+      - name: Build Kernel
+        run: |
+          cd kernel
+          make ARCH=arm64 \
+            CC=clang \
+            CLANG_TRIPLE=aarch64-linux-gnu- \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
+            -j$(nproc)
+
+      - name: Upload Kernel Image
+        uses: actions/upload-artifact@v4
+        with:
+          name: nevada-kernel-nethunter-susfs
+          path: kernel/arch/arm64/boot/Image.gz-dtb   # Adjust if your output is Image or Image.gz
