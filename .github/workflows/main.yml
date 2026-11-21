@@ -1,81 +1,354 @@
-name: Build Nevada Kernel with NetHunter & SUSFS
+name: Nevada stock kernel build and Gemini review
 
 on:
-  workflow_dispatch:   # Allows manual trigger from the Actions tab
   push:
-    branches: [ main ]
+    branches: [main]
+  pull_request:
+    types: [opened, reopened, synchronize, ready_for_review]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nevada-stock-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
-  build-kernel:
-    runs-on: ubuntu-22.04
+  build-stock-kernel:
+    name: Compile Motorola stock kernel image
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+    permissions:
+      contents: read
+    env:
+      SRC_REPO: MotorolaMobilityLLC/kernel-mtk
+      SRC_BRANCH: android-16-release-w1wn36.18-114
+      SRC_SHA: 0fa176ca7f56c349b51acd83684284c02ced5854
+      CONFIG_REPO: BalsacTheJew666/nevada-nethunter-baseline-xt2615
+      CONFIG_BLOB_SHA: 21996d53d1dc7ee0c7f4e037b8fdb3276108db83
+      EXPECTED_CONFIG_SHA256: 1ccf202965646f03f880c868e5a1558b80412201df044b096a13b73ddcc4fe3e
+      ANDROID_CLANG_COMMIT: 56fc36f789871f93ae5c6c038c76e5bf10b5d9a6
     steps:
-      - name: Checkout Kernel Source
+      - name: Checkout build definitions
         uses: actions/checkout@v4
         with:
-          repository: MotorolaMobilityLLC/kernel-mtk
-          ref: android-16-release-w1wn36.18-114   # Branch for Nevada / MT6835[reference:3]
-          path: kernel
-          fetch-depth: 1
+          persist-credentials: false
 
-      - name: Set up build environment
+      - name: Initialize reports and verify device metadata
+        shell: bash
         run: |
-          sudo apt-get update
-          sudo apt-get install -y git curl bc bison build-essential flex \
-            libssl-dev libelf-dev python3 zip
-          # Install AOSP Clang (r487747c – adjust if needed for your kernel)
-          git clone --depth=1 https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86 -b main /tmp/clang
-          export PATH=/tmp/clang/clang-r487747c/bin:$PATH
-          echo "PATH=/tmp/clang/clang-r487747c/bin:$PATH" >> $GITHUB_ENV
+          set -euo pipefail
+          mkdir -p reports out configs
+          cat > reports/BUILD-STATUS.txt <<'EOF'
+          XT2615-1 / NEVADA — compile-only stock kernel image.
+          This job does not create a boot.img, vendor_boot.img, dtbo.img, installer, or flashable package.
+          Do not flash this artifact. No runtime boot validation has been performed.
+          No NetHunter, KernelSU, SUSFS, KMI-supplement, or other experimental patches are applied.
+          EOF
+          cat device/device-baseline.txt | tee reports/device-baseline.txt
+          {
+            echo "Source repository: ${SRC_REPO}"
+            echo "Source branch: ${SRC_BRANCH}"
+            echo "Pinned source commit: ${SRC_SHA}"
+            echo "Private stock config blob: ${CONFIG_BLOB_SHA}"
+            echo "Android Clang source commit: ${ANDROID_CLANG_COMMIT}"
+          } | tee reports/build-inputs.txt
+          test -s device/device-baseline.txt
+          grep -Fq "Model: nevada" device/device-baseline.txt
+          grep -Fq "Firmware: W1WNS36.18-114-1" device/device-baseline.txt
+          grep -Fq "Pinned source commit: ${SRC_SHA}" device/device-baseline.txt
 
-      - name: Apply Kali NetHunter Patches
+      - name: Install host build dependencies
+        shell: bash
         run: |
-          cd kernel
-          # Clone the official NetHunter kernel patch set
-          git clone --depth=1 https://gitlab.com/kalilinux/nethunter/build-scripts/kali-nethunter-kernel.git /tmp/nethunter-patches
-          # Apply patches (order matters – adjust if you have a specific patch list)
-          for p in /tmp/nethunter-patches/*.patch; do
-            echo "Applying $p"
-            git am "$p" || git apply "$p"   # fallback to apply if am fails
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            bc bison build-essential cpio curl dwarves flex gcc-aarch64-linux-gnu \
+            git libelf-dev libncurses-dev libssl-dev make python3 rsync \
+            xz-utils zstd file
+          {
+            clang --version || true
+            gcc --version
+            make --version
+            df -h "${GITHUB_WORKSPACE}"
+            free -h
+          } 2>&1 | tee reports/host-before-cleanup.txt
+
+      - name: Reclaim unused hosted-runner SDK space
+        shell: bash
+        run: |
+          set -euo pipefail
+          # This affects only the disposable GitHub-hosted VM.
+          for d in /usr/share/dotnet /usr/local/lib/android/sdk /opt/ghc /usr/local/share/powershell; do
+            if [ -d "$d" ]; then
+              sudo rm -rf -- "$d"
+              echo "Removed unused runner directory: $d"
+            fi
           done
+          {
+            echo "=== Available storage ==="
+            df -h "${GITHUB_WORKSPACE}"
+            echo "=== Memory ==="
+            free -h
+            echo "=== CPU ==="
+            nproc
+          } 2>&1 | tee reports/runner-resources.txt
 
-      - name: Apply SUSFS Patches
+      - name: Fetch immutable stock configuration from private baseline repository
+        shell: bash
+        env:
+          PRIVATE_REPO_TOKEN: ${{ secrets.PRIVATE_REPO_TOKEN }}
         run: |
-          cd kernel
-          # Clone the SUSFS patch repository (WildKernels maintains a common set)
-          git clone --depth=1 https://github.com/WildKernels/kernel_patches.git /tmp/susfs-patches
-          # Apply the SUSFS patches (adjust the path to the correct version for your kernel)
-          # Example: /tmp/susfs-patches/susfs/v2.0.0/*.patch
-          SUSFS_DIR="/tmp/susfs-patches/susfs/v2.0.0"   # <-- CHANGE to the version you need
-          if [ -d "$SUSFS_DIR" ]; then
-            for p in "$SUSFS_DIR"/*.patch; do
-              echo "Applying SUSFS patch $p"
-              git apply "$p" || git am "$p"
-            done
-          else
-            echo "SUSFS patch directory $SUSFS_DIR not found – please update the path."
+          set -euo pipefail
+          if [ -z "${PRIVATE_REPO_TOKEN:-}" ]; then
+            echo "::error::PRIVATE_REPO_TOKEN is missing. Add a fine-grained token with Contents: read on ${CONFIG_REPO}."
             exit 1
           fi
+          body="$(mktemp)"
+          trap 'rm -f "$body"' EXIT
+          status="$(curl --silent --show-error --location \
+            --output "$body" --write-out '%{http_code}' \
+            --header "Accept: application/vnd.github+json" \
+            --header "Authorization: Bearer $PRIVATE_REPO_TOKEN" \
+            --header "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/${CONFIG_REPO}/git/blobs/${CONFIG_BLOB_SHA}")"
+          if [ "$status" != 200 ]; then
+            echo "::error::Private stock-config fetch failed (HTTP $status). The token value was not printed."
+            exit 1
+          fi
+          python3 - "$body" "$CONFIG_BLOB_SHA" configs/nevada-stock.config.gz <<'PY'
+          import base64, hashlib, json, pathlib, sys
+          response = json.loads(pathlib.Path(sys.argv[1]).read_text())
+          expected = sys.argv[2]
+          if response.get("sha") != expected:
+              raise SystemExit("GitHub returned a different stock-config blob SHA")
+          payload = base64.b64decode(response["content"])
+          git_sha = hashlib.sha1(b"blob %d\0" % len(payload) + payload).hexdigest()
+          if git_sha != expected:
+              raise SystemExit("Downloaded stock-config bytes do not match the pinned Git blob SHA")
+          destination = pathlib.Path(sys.argv[3])
+          destination.parent.mkdir(parents=True, exist_ok=True)
+          destination.write_bytes(payload)
+          print("Pinned stock config downloaded and Git-blob SHA verified:", git_sha)
+          PY
+          gzip -t configs/nevada-stock.config.gz
+          gzip -dc configs/nevada-stock.config.gz > out/.config
+          actual_config_sha="$(sha256sum out/.config | awk '{print $1}')"
+          echo "Decompressed stock config SHA256: $actual_config_sha" | tee reports/stock-config-sha256.txt
+          test "$actual_config_sha" = "$EXPECTED_CONFIG_SHA256" || {
+            echo "::error::The stock .config does not match the SHA256 recorded in device/device-baseline.txt."
+            exit 1
+          }
+          grep -qx 'CONFIG_MODULES=y' out/.config
+          grep -qx 'CONFIG_CC_IS_CLANG=y' out/.config
 
-      - name: Configure Kernel
+      - name: Fetch Motorola source at the exact pinned commit
+        shell: bash
         run: |
-          cd kernel
-          # The defconfig for Nevada is likely nevada_defconfig or mt6835_defconfig.
-          # Check arch/arm64/configs/ in the kernel tree to confirm.
-          make ARCH=arm64 nevada_defconfig   # <-- VERIFY the defconfig name
-          # (If the above fails, try: make ARCH=arm64 mt6835_defconfig)
+          set -euo pipefail
+          git init -q kernel-5.15
+          git -C kernel-5.15 remote add origin "https://github.com/$SRC_REPO.git"
+          git -C kernel-5.15 -c protocol.version=2 fetch --depth=1 origin "$SRC_SHA"
+          git -C kernel-5.15 checkout --detach FETCH_HEAD
+          actual="$(git -C kernel-5.15 rev-parse HEAD)"
+          printf 'Expected: %s\nActual:   %s\n' "$SRC_SHA" "$actual" | tee reports/source-identity.txt
+          test "$actual" = "$SRC_SHA"
+          test -f kernel-5.15/Makefile
+          test -f kernel-5.15/build.config.mtk.aarch64
+          grep -q '^VERSION = 5$' kernel-5.15/Makefile
+          grep -q '^PATCHLEVEL = 15$' kernel-5.15/Makefile
+          grep -q '^SUBLEVEL = 180$' kernel-5.15/Makefile
+          git -C kernel-5.15 status --short
 
-      - name: Build Kernel
+      - name: Install pinned Android Clang 14.0.7 and LLD 14
+        shell: bash
         run: |
-          cd kernel
-          make ARCH=arm64 \
-            CC=clang \
-            CLANG_TRIPLE=aarch64-linux-gnu- \
-            CROSS_COMPILE=aarch64-linux-gnu- \
-            CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
-            -j$(nproc)
+          set -euo pipefail
+          tool_dir="${RUNNER_TEMP}/android-llvm"
+          mkdir -p "$tool_dir"
+          git -C "$tool_dir" init -q
+          git -C "$tool_dir" remote add origin \
+            https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86
+          git -C "$tool_dir" -c protocol.version=2 fetch --depth=1 --filter=blob:none \
+            origin "$ANDROID_CLANG_COMMIT"
+          git -C "$tool_dir" sparse-checkout init --cone
+          git -C "$tool_dir" sparse-checkout set clang-r450784e
+          git -C "$tool_dir" checkout --detach FETCH_HEAD
+          test "$(git -C "$tool_dir" rev-parse HEAD)" = "$ANDROID_CLANG_COMMIT"
+          clang_bin="$tool_dir/clang-r450784e/bin"
+          test -x "$clang_bin/clang"
+          test -x "$clang_bin/ld.lld"
+          "$clang_bin/clang" --version | tee reports/clang-version.txt
+          "$clang_bin/ld.lld" --version | tee reports/lld-version.txt
+          grep -Fq 'clang version 14.0.7' reports/clang-version.txt
+          grep -Eq '^LLD 14\.' reports/lld-version.txt
+          echo "$clang_bin" >> "$GITHUB_PATH"
 
-      - name: Upload Kernel Image
+      - name: Reconcile configuration against the pinned source Kconfig
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp out/.config reports/config-before-olddefconfig.txt
+          make -C kernel-5.15 O="$GITHUB_WORKSPACE/out" \
+            ARCH=arm64 LLVM=1 LLVM_IAS=1 CROSS_COMPILE=aarch64-linux-gnu- \
+            olddefconfig 2>&1 | tee reports/olddefconfig.log
+          diff -u reports/config-before-olddefconfig.txt out/.config \
+            > reports/config-olddefconfig.diff || true
+          cp out/.config reports/config-after-olddefconfig.txt
+          sha256sum out/.config | tee reports/config-after-sha256.txt
+          grep -qx 'CONFIG_MODULES=y' out/.config
+          grep -qx 'CONFIG_CC_IS_CLANG=y' out/.config
+
+      - name: Compile stock Image.gz with bounded memory use
+        shell: bash
+        run: |
+          set -euo pipefail
+          LINKER='ld.lld --threads=1'
+          {
+            echo "Build start: $(date -u)"
+            echo "Build target: Image.gz only"
+            echo "Parallel jobs: 2"
+            echo "Linker: $LINKER"
+            free -h
+            df -h "$GITHUB_WORKSPACE"
+          } | tee reports/build-start.txt
+
+          (
+            while true; do
+              {
+                echo "===== $(date -u) ====="
+                free -m
+                df -h "$GITHUB_WORKSPACE"
+                ps -eo pid,comm,rss,etime --sort=-rss | sed -n '1,12p'
+                if [ -r /sys/fs/cgroup/memory.events ]; then
+                  cat /sys/fs/cgroup/memory.events
+                fi
+              } >> reports/resource-heartbeat.log 2>&1
+              sleep 120
+            done
+          ) &
+          watch_pid=$!
+
+          set +e
+          timeout -s TERM -k 30s 180m \
+            make -C kernel-5.15 O="$GITHUB_WORKSPACE/out" \
+              ARCH=arm64 LLVM=1 LLVM_IAS=1 CROSS_COMPILE=aarch64-linux-gnu- \
+              LD="$LINKER" -j2 Image.gz 2>&1 | tee reports/build.log
+          build_rc=${PIPESTATUS[0]}
+          set -e
+
+          kill "$watch_pid" 2>/dev/null || true
+          wait "$watch_pid" 2>/dev/null || true
+          {
+            echo "Image.gz compile exit status: $build_rc"
+            echo "Build end: $(date -u)"
+            free -h
+            df -h "$GITHUB_WORKSPACE"
+          } 2>&1 | tee reports/build-summary.txt
+          if [ "$build_rc" -ne 0 ]; then
+            if [ "$build_rc" -eq 124 ]; then
+              echo "Build exceeded the 180-minute command limit." | tee -a reports/build-summary.txt
+            fi
+            exit "$build_rc"
+          fi
+          test -s out/arch/arm64/boot/Image.gz
+          sha256sum out/arch/arm64/boot/Image.gz | tee reports/Image.gz.sha256
+          make -s -C kernel-5.15 O="$GITHUB_WORKSPACE/out" \
+            ARCH=arm64 LLVM=1 LLVM_IAS=1 kernelrelease | tee reports/kernelrelease.txt
+
+      - name: Upload compile artifact and provenance reports
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: nevada-kernel-nethunter-susfs
-          path: kernel/arch/arm64/boot/Image.gz-dtb   # Adjust if your output is Image or Image.gz
+          name: NEVADA-STOCK-IMAGE-DO-NOT-FLASH
+          path: |
+            reports/
+            out/arch/arm64/boot/Image.gz
+            out/.config
+            out/Module.symvers
+            out/System.map
+            out/include/config/kernel.release
+          include-hidden-files: true
+          if-no-files-found: warn
+          retention-days: 14
+
+  gemini-code-review:
+    name: Free-tier Gemini pull-request review
+    if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.draft == false
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: write
+    steps:
+      - name: Check whether Gemini API key is configured
+        id: gemini-key
+        shell: bash
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: |
+          if [ -n "${GEMINI_API_KEY:-}" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+            echo "Gemini review is enabled."
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::Gemini review skipped. Add the GEMINI_API_KEY Actions secret to enable free-tier AI reviews."
+          fi
+
+      - name: Checkout pull-request source
+        if: steps.gemini-key.outputs.enabled == 'true'
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Run Gemini code review
+        if: steps.gemini-key.outputs.enabled == 'true'
+        uses: google-github-actions/run-gemini-cli@f77273f4c914e4bf38440cf36a0369cb64a37489
+        env:
+          GEMINI_CLI_TRUST_WORKSPACE: 'true'
+          GITHUB_TOKEN: ${{ github.token }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        with:
+          gemini_api_key: ${{ secrets.GEMINI_API_KEY }}
+          workflow_name: nevada-gemini-review
+          github_pr_number: ${{ github.event.pull_request.number }}
+          extensions: |
+            https://github.com/gemini-cli-extensions/code-review
+          prompt: '/pr-code-review'
+          settings: |
+            {
+              "model": {
+                "maxSessionTurns": 20
+              },
+              "telemetry": {
+                "enabled": false
+              },
+              "mcpServers": {
+                "github": {
+                  "command": "docker",
+                  "args": [
+                    "run",
+                    "-i",
+                    "--rm",
+                    "-e",
+                    "GITHUB_PERSONAL_ACCESS_TOKEN",
+                    "ghcr.io/github/github-mcp-server:v0.27.0"
+                  ],
+                  "includeTools": [
+                    "add_comment_to_pending_review",
+                    "pull_request_read",
+                    "pull_request_review_write"
+                  ],
+                  "env": {
+                    "GITHUB_PERSONAL_ACCESS_TOKEN": "${GITHUB_TOKEN}"
+                  }
+                }
+              },
+              "tools": {
+                "core": []
+              }
+            }
