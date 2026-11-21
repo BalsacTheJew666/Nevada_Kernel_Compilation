@@ -1,0 +1,8 @@
+Model: nevada
+Firmware: W1WNS36.18-114-1
+Kernel: 5.15.180-android13-8-00018-g9b2308ac0ad6-ab14563692
+Architecture: aarch64
+Kernel-config SHA256: 1ccf202965646f03f880c868e5a1558b80412201df044b096a13b73ddcc4fe3e
+Source: MotorolaMobilityLLC/kernel-mtk
+Branch: android-16-release-w1wn36.18-114
+Pinned source commit: 0fa176ca7f56c349b51acd83684284c02ced5854
