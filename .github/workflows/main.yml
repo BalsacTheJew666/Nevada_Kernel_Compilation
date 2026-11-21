@@ -163,6 +163,265 @@ jobs:
           grep -q '^SUBLEVEL = 180$' kernel-5.15/Makefile
           git -C kernel-5.15 status --short
 
+      - name: Materialize pinned MTK ABI whitelist for stock config
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib
+          import pathlib
+          import re
+          import subprocess
+
+          config = pathlib.Path("out/.config").read_text().splitlines()
+          entries = [line for line in config if line.startswith('CONFIG_UNUSED_KSYMS_WHITELIST=')]
+          if len(entries) != 1:
+              raise SystemExit(f"Expected exactly one UNUSED_KSYMS_WHITELIST setting, found {len(entries)}")
+          match = re.fullmatch(r'CONFIG_UNUSED_KSYMS_WHITELIST="([^"]+)"', entries[0])
+          if not match:
+              raise SystemExit("Whitelist setting is not a simple quoted path")
+          configured_path = match.group(1)
+          expected_path = "/mnt/disks/build-disk/src/android/common-android13-5.15-2025-05/out/android13-5.15/common/abi_symbollist.raw"
+          if configured_path != expected_path:
+              raise SystemExit(f"Unexpected whitelist path in pinned config: {configured_path}")
+
+          build_config = pathlib.Path("kernel-5.15/build.config.mtk.aarch64").read_text()
+          if not re.search(r'^KMI_SYMBOL_LIST=android/abi_gki_aarch64_mtk
+        shell: bash
+        run: |
+          set -euo pipefail
+          tool_dir="${RUNNER_TEMP}/android-llvm"
+          mkdir -p "$tool_dir"
+          git -C "$tool_dir" init -q
+          git -C "$tool_dir" remote add origin \
+            https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86
+          git -C "$tool_dir" -c protocol.version=2 fetch --depth=1 --filter=blob:none \
+            origin "$ANDROID_CLANG_COMMIT"
+          git -C "$tool_dir" sparse-checkout init --cone
+          git -C "$tool_dir" sparse-checkout set clang-r450784e
+          git -C "$tool_dir" checkout --detach FETCH_HEAD
+          test "$(git -C "$tool_dir" rev-parse HEAD)" = "$ANDROID_CLANG_COMMIT"
+          clang_bin="$tool_dir/clang-r450784e/bin"
+          test -x "$clang_bin/clang"
+          test -x "$clang_bin/ld.lld"
+          "$clang_bin/clang" --version | tee reports/clang-version.txt
+          "$clang_bin/ld.lld" --version | tee reports/lld-version.txt
+          grep -Fq 'clang version 14.0.7' reports/clang-version.txt
+          grep -Eq '^LLD 14\.' reports/lld-version.txt
+          echo "$clang_bin" >> "$GITHUB_PATH"
+
+      - name: Reconcile configuration against the pinned source Kconfig
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp out/.config reports/config-before-olddefconfig.txt
+          make -C kernel-5.15 O="$GITHUB_WORKSPACE/out" \
+            ARCH=arm64 LLVM=1 LLVM_IAS=1 CROSS_COMPILE=aarch64-linux-gnu- \
+            olddefconfig 2>&1 | tee reports/olddefconfig.log
+          diff -u reports/config-before-olddefconfig.txt out/.config \
+            > reports/config-olddefconfig.diff || true
+          cp out/.config reports/config-after-olddefconfig.txt
+          sha256sum out/.config | tee reports/config-after-sha256.txt
+          grep -qx 'CONFIG_MODULES=y' out/.config
+          grep -qx 'CONFIG_CC_IS_CLANG=y' out/.config
+
+      - name: Compile stock Image.gz with bounded memory use
+        shell: bash
+        run: |
+          set -euo pipefail
+          LINKER='ld.lld --threads=1'
+          {
+            echo "Build start: $(date -u)"
+            echo "Build target: Image.gz only"
+            echo "Parallel jobs: 2"
+            echo "Linker: $LINKER"
+            free -h
+            df -h "$GITHUB_WORKSPACE"
+          } | tee reports/build-start.txt
+
+          (
+            while true; do
+              {
+                echo "===== $(date -u) ====="
+                free -m
+                df -h "$GITHUB_WORKSPACE"
+                ps -eo pid,comm,rss,etime --sort=-rss | sed -n '1,12p'
+                if [ -r /sys/fs/cgroup/memory.events ]; then
+                  cat /sys/fs/cgroup/memory.events
+                fi
+              } >> reports/resource-heartbeat.log 2>&1
+              sleep 120
+            done
+          ) &
+          watch_pid=$!
+
+          set +e
+          timeout -s TERM -k 30s 180m \
+            make -C kernel-5.15 O="$GITHUB_WORKSPACE/out" \
+              ARCH=arm64 LLVM=1 LLVM_IAS=1 CROSS_COMPILE=aarch64-linux-gnu- \
+              LD="$LINKER" -j2 Image.gz 2>&1 | tee reports/build.log
+          build_rc=${PIPESTATUS[0]}
+          set -e
+
+          kill "$watch_pid" 2>/dev/null || true
+          wait "$watch_pid" 2>/dev/null || true
+          {
+            echo "Image.gz compile exit status: $build_rc"
+            echo "Build end: $(date -u)"
+            free -h
+            df -h "$GITHUB_WORKSPACE"
+          } 2>&1 | tee reports/build-summary.txt
+          if [ "$build_rc" -ne 0 ]; then
+            if [ "$build_rc" -eq 124 ]; then
+              echo "Build exceeded the 180-minute command limit." | tee -a reports/build-summary.txt
+            fi
+            exit "$build_rc"
+          fi
+          test -s out/arch/arm64/boot/Image.gz
+          sha256sum out/arch/arm64/boot/Image.gz | tee reports/Image.gz.sha256
+          make -s -C kernel-5.15 O="$GITHUB_WORKSPACE/out" \
+            ARCH=arm64 LLVM=1 LLVM_IAS=1 kernelrelease | tee reports/kernelrelease.txt
+
+      - name: Upload compile artifact and provenance reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: NEVADA-STOCK-IMAGE-DO-NOT-FLASH
+          path: |
+            reports/
+            out/arch/arm64/boot/Image.gz
+            out/.config
+            out/Module.symvers
+            out/System.map
+            out/include/config/kernel.release
+          include-hidden-files: true
+          if-no-files-found: warn
+          retention-days: 14
+
+  gemini-code-review:
+    name: Free-tier Gemini pull-request review
+    if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.draft == false
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: write
+    steps:
+      - name: Check whether Gemini API key is configured
+        id: gemini-key
+        shell: bash
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: |
+          if [ -n "${GEMINI_API_KEY:-}" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+            echo "Gemini review is enabled."
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::Gemini review skipped. Add the GEMINI_API_KEY Actions secret to enable free-tier AI reviews."
+          fi
+
+      - name: Checkout pull-request source
+        if: steps.gemini-key.outputs.enabled == 'true'
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Run Gemini code review
+        if: steps.gemini-key.outputs.enabled == 'true'
+        uses: google-github-actions/run-gemini-cli@f77273f4c914e4bf38440cf36a0369cb64a37489
+        env:
+          GEMINI_CLI_TRUST_WORKSPACE: 'true'
+          GITHUB_TOKEN: ${{ github.token }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        with:
+          gemini_api_key: ${{ secrets.GEMINI_API_KEY }}
+          workflow_name: nevada-gemini-review
+          github_pr_number: ${{ github.event.pull_request.number }}
+          extensions: |
+            https://github.com/gemini-cli-extensions/code-review
+          prompt: '/pr-code-review'
+          settings: |
+            {
+              "model": {
+                "maxSessionTurns": 20
+              },
+              "telemetry": {
+                "enabled": false
+              },
+              "mcpServers": {
+                "github": {
+                  "command": "docker",
+                  "args": [
+                    "run",
+                    "-i",
+                    "--rm",
+                    "-e",
+                    "GITHUB_PERSONAL_ACCESS_TOKEN",
+                    "ghcr.io/github/github-mcp-server:v0.27.0"
+                  ],
+                  "includeTools": [
+                    "add_comment_to_pending_review",
+                    "pull_request_read",
+                    "pull_request_review_write"
+                  ],
+                  "env": {
+                    "GITHUB_PERSONAL_ACCESS_TOKEN": "${GITHUB_TOKEN}"
+                  }
+                }
+              },
+              "tools": {
+                "core": []
+              }
+            }
+, build_config, re.M):
+              raise SystemExit("Pinned MTK build config does not identify android/abi_gki_aarch64_mtk as its KMI symbol list")
+
+          source = pathlib.Path("kernel-5.15/android/abi_gki_aarch64_mtk")
+          source_lines = source.read_text().splitlines()
+          if not source_lines or source_lines[0].strip() != "[abi_symbol_list]":
+              raise SystemExit("Unexpected format in pinned MTK ABI symbol list")
+          symbols = [line.strip() for line in source_lines[1:] if line.strip() and not line.lstrip().startswith("#")]
+          invalid = [symbol for symbol in symbols if not re.fullmatch(r"[A-Za-z0-9_.$]+", symbol)]
+          if invalid:
+              raise SystemExit(f"Invalid ABI symbol names found: {invalid[:5]}")
+          unique_symbols = list(dict.fromkeys(symbols))
+          if len(unique_symbols) < 1000:
+              raise SystemExit(f"Refusing suspiciously small MTK ABI whitelist: {len(unique_symbols)} symbols")
+
+          raw = ("\n".join(unique_symbols) + "\n").encode()
+          pathlib.Path("abi").mkdir(exist_ok=True)
+          pathlib.Path("abi/abi_symbollist.raw").write_bytes(raw)
+          source_blob = subprocess.check_output(
+              ["git", "-C", "kernel-5.15", "rev-parse", f"{SRC_SHA}:android/abi_gki_aarch64_mtk"],
+              text=True
+          ).strip()
+          report = [
+              "ABI whitelist provenance",
+              f"Source repository: {SRC_REPO}",
+              f"Source commit: {SRC_SHA}",
+              "Source file: android/abi_gki_aarch64_mtk",
+              f"Source Git blob: {source_blob}",
+              f"Source entries (excluding format header): {len(symbols)}",
+              f"Unique symbols materialized: {len(unique_symbols)}",
+              f"Duplicate entries removed: {len(symbols) - len(unique_symbols)}",
+              f"Raw whitelist SHA256: {hashlib.sha256(raw).hexdigest()}",
+              f"Configured absolute path: {configured_path}",
+              "The stock .config was not edited; this file materializes its pinned MTK KMI whitelist at the path it expects.",
+              "",
+          ]
+          pathlib.Path("reports/abi-whitelist-provenance.txt").write_text("\n".join(report))
+          print("\n".join(report))
+          PY
+          whitelist_path="/mnt/disks/build-disk/src/android/common-android13-5.15-2025-05/out/android13-5.15/common/abi_symbollist.raw"
+          sudo install -D -m 0644 abi/abi_symbollist.raw "$whitelist_path"
+          sudo test -s "$whitelist_path"
+          sudo cmp --silent abi/abi_symbollist.raw "$whitelist_path"
+          sha256sum out/.config | tee reports/config-before-build-sha256.txt
+          test "$(sha256sum out/.config | awk '{print $1}')" = "$EXPECTED_CONFIG_SHA256"
+          echo "Pinned MTK ABI whitelist installed and verified at the exact path required by the stock config." | tee -a reports/abi-whitelist-provenance.txt
+
       - name: Install pinned Android Clang 14.0.7 and LLD 14
         shell: bash
         run: |
