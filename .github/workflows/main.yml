@@ -28,7 +28,7 @@ jobs:
       SRC_SHA: 0fa176ca7f56c349b51acd83684284c02ced5854
       CONFIG_REPO: BalsacTheJew666/nevada-nethunter-baseline-xt2615
       CONFIG_BLOB_SHA: 21996d53d1dc7ee0c7f4e037b8fdb3276108db83
-      EXPECTED_CONFIG_SHA256: 1ccf202965646f03f880c868e5a1558b80412201df044b096a13b73ddcc4fe3e
+      EXPECTED_CONFIG_SHA256: e3cdaf997a7e2eb70e441944bdfd9af359aa82e8a2d5cb9534d2bce5fcd4a78a
       ANDROID_CLANG_COMMIT: 56fc36f789871f93ae5c6c038c76e5bf10b5d9a6
     steps:
       - name: Checkout build definitions
