@@ -478,7 +478,9 @@ jobs:
           [ -s out/Module.symvers ] || cp out/vmlinux.symvers out/Module.symvers
           make -C kernel-5.15 O="$GITHUB_WORKSPACE/out" \
             ARCH=arm64 LLVM=1 LLVM_IAS=1 CROSS_COMPILE=aarch64-linux-gnu- \
+            KBUILD_MODPOST_WARN=1 \
             M="$susfs_dir" -j2 modules 2>&1 | tee reports/susfs-lkm-build.log
+          grep 'WARNING: modpost: ".*" .* undefined' reports/susfs-lkm-build.log | tee reports/susfs-lkm-kallsyms-imports.txt || true
           ko="$(find "$susfs_dir" -name 'susfs_guard_lkm.ko' | head -n1)"
           test -n "$ko"
           mkdir -p out/ksu-modules
