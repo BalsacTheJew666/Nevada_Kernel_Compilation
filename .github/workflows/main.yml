@@ -169,9 +169,13 @@ jobs:
           set -euo pipefail
           python3 - <<'PY'
           import hashlib
+          import os
           import pathlib
           import re
           import subprocess
+
+          SRC_SHA = os.environ["SRC_SHA"]
+          SRC_REPO = os.environ["SRC_REPO"]
 
           config = pathlib.Path("out/.config").read_text().splitlines()
           entries = [line for line in config if line.startswith('CONFIG_UNUSED_KSYMS_WHITELIST=')]
