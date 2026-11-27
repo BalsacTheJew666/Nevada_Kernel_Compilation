@@ -1,0 +1,426 @@
+name: Nevada KernelSU-Next + SUSFS kernel build
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nevada-ksu-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-stock-kernel:
+    name: Compile KernelSU-Next kernel image (DO NOT FLASH yet)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 355
+    permissions:
+      contents: read
+    env:
+      SRC_REPO: MotorolaMobilityLLC/kernel-mtk
+      SRC_BRANCH: android-16-release-w1wn36.18-114
+      SRC_SHA: 0fa176ca7f56c349b51acd83684284c02ced5854
+      CONFIG_REPO: BalsacTheJew666/nevada-nethunter-baseline-xt2615
+      CONFIG_BLOB_SHA: 21996d53d1dc7ee0c7f4e037b8fdb3276108db83
+      EXPECTED_CONFIG_SHA256: e3cdaf997a7e2eb70e441944bdfd9af359aa82e8a2d5cb9534d2bce5fcd4a78a
+      ANDROID_CLANG_COMMIT: 56fc36f789871f93ae5c6c038c76e5bf10b5d9a6
+      KSU_NEXT_REPO: KernelSU-Next/KernelSU-Next
+      KSU_NEXT_TAG: v3.4.2
+    steps:
+      - name: Checkout build definitions
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Initialize reports and verify device metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p reports out configs
+          cat > reports/BUILD-STATUS.txt <<'EOF'
+          XT2615-1 / NEVADA — compile-only stock kernel image.
+          This job does not create a boot.img, vendor_boot.img, dtbo.img, installer, or flashable package.
+          Do not flash this artifact. No runtime boot validation has been performed.
+          No NetHunter, KernelSU, SUSFS, KMI-supplement, or other experimental patches are applied.
+          EOF
+          cat device/device-baseline.txt | tee reports/device-baseline.txt
+          {
+            echo "Source repository: ${SRC_REPO}"
+            echo "Source branch: ${SRC_BRANCH}"
+            echo "Pinned source commit: ${SRC_SHA}"
+            echo "Private stock config blob: ${CONFIG_BLOB_SHA}"
+            echo "Android Clang source commit: ${ANDROID_CLANG_COMMIT}"
+          } | tee reports/build-inputs.txt
+          test -s device/device-baseline.txt
+          grep -Fq "Model: nevada" device/device-baseline.txt
+          grep -Fq "Firmware: W1WNS36.18-114-1" device/device-baseline.txt
+          grep -Fq "Pinned source commit: ${SRC_SHA}" device/device-baseline.txt
+
+      - name: Install host build dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            bc bison build-essential cpio curl dwarves flex gcc-aarch64-linux-gnu \
+            git libelf-dev libncurses-dev libssl-dev make python3 rsync \
+            xz-utils zstd file
+          {
+            clang --version || true
+            gcc --version
+            make --version
+            df -h "${GITHUB_WORKSPACE}"
+            free -h
+          } 2>&1 | tee reports/host-before-cleanup.txt
+
+      - name: Reclaim unused hosted-runner SDK space
+        shell: bash
+        run: |
+          set -euo pipefail
+          # This affects only the disposable GitHub-hosted VM.
+          for d in /usr/share/dotnet /usr/local/lib/android/sdk /opt/ghc /usr/local/share/powershell; do
+            if [ -d "$d" ]; then
+              sudo rm -rf -- "$d"
+              echo "Removed unused runner directory: $d"
+            fi
+          done
+          {
+            echo "=== Available storage ==="
+            df -h "${GITHUB_WORKSPACE}"
+            echo "=== Memory ==="
+            free -h
+            echo "=== CPU ==="
+            nproc
+          } 2>&1 | tee reports/runner-resources.txt
+
+      - name: Fetch immutable stock configuration from private baseline repository
+        shell: bash
+        env:
+          PRIVATE_REPO_TOKEN: ${{ secrets.PRIVATE_REPO_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${PRIVATE_REPO_TOKEN:-}" ]; then
+            echo "::error::PRIVATE_REPO_TOKEN is missing. Add a fine-grained token with Contents: read on ${CONFIG_REPO}."
+            exit 1
+          fi
+          body="$(mktemp)"
+          trap 'rm -f "$body"' EXIT
+          status="$(curl --silent --show-error --location \
+            --output "$body" --write-out '%{http_code}' \
+            --header "Accept: application/vnd.github+json" \
+            --header "Authorization: Bearer $PRIVATE_REPO_TOKEN" \
+            --header "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/${CONFIG_REPO}/git/blobs/${CONFIG_BLOB_SHA}")"
+          if [ "$status" != 200 ]; then
+            echo "::error::Private stock-config fetch failed (HTTP $status). The token value was not printed."
+            exit 1
+          fi
+          python3 - "$body" "$CONFIG_BLOB_SHA" configs/nevada-stock.config.gz <<'PY'
+          import base64, hashlib, json, pathlib, sys
+          response = json.loads(pathlib.Path(sys.argv[1]).read_text())
+          expected = sys.argv[2]
+          if response.get("sha") != expected:
+              raise SystemExit("GitHub returned a different stock-config blob SHA")
+          payload = base64.b64decode(response["content"])
+          git_sha = hashlib.sha1(b"blob %d\0" % len(payload) + payload).hexdigest()
+          if git_sha != expected:
+              raise SystemExit("Downloaded stock-config bytes do not match the pinned Git blob SHA")
+          destination = pathlib.Path(sys.argv[3])
+          destination.parent.mkdir(parents=True, exist_ok=True)
+          destination.write_bytes(payload)
+          print("Pinned stock config downloaded and Git-blob SHA verified:", git_sha)
+          PY
+          gzip -t configs/nevada-stock.config.gz
+          gzip -dc configs/nevada-stock.config.gz > out/.config
+          actual_config_sha="$(sha256sum out/.config | awk '{print $1}')"
+          echo "Decompressed stock config SHA256: $actual_config_sha" | tee reports/stock-config-sha256.txt
+          test "$actual_config_sha" = "$EXPECTED_CONFIG_SHA256" || {
+            echo "::error::The stock .config does not match the SHA256 recorded in device/device-baseline.txt."
+            exit 1
+          }
+          grep -qx 'CONFIG_MODULES=y' out/.config
+          grep -qx 'CONFIG_CC_IS_CLANG=y' out/.config
+
+      - name: Fetch Motorola source at the exact pinned commit
+        shell: bash
+        run: |
+          set -euo pipefail
+          git init -q kernel-5.15
+          git -C kernel-5.15 remote add origin "https://github.com/$SRC_REPO.git"
+          git -C kernel-5.15 -c protocol.version=2 fetch --depth=1 origin "$SRC_SHA"
+          git -C kernel-5.15 checkout --detach FETCH_HEAD
+          actual="$(git -C kernel-5.15 rev-parse HEAD)"
+          printf 'Expected: %s\nActual:   %s\n' "$SRC_SHA" "$actual" | tee reports/source-identity.txt
+          test "$actual" = "$SRC_SHA"
+          test -f kernel-5.15/Makefile
+          test -f kernel-5.15/build.config.mtk.aarch64
+          grep -q '^VERSION = 5$' kernel-5.15/Makefile
+          grep -q '^PATCHLEVEL = 15$' kernel-5.15/Makefile
+          grep -q '^SUBLEVEL = 180$' kernel-5.15/Makefile
+          git -C kernel-5.15 status --short
+
+      - name: Materialize pinned MTK ABI whitelist for stock config
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib
+          import os
+          import pathlib
+          import re
+          import subprocess
+
+          SRC_SHA = os.environ["SRC_SHA"]
+          SRC_REPO = os.environ["SRC_REPO"]
+
+          config = pathlib.Path("out/.config").read_text().splitlines()
+          entries = [line for line in config if line.startswith('CONFIG_UNUSED_KSYMS_WHITELIST=')]
+          if len(entries) != 1:
+              raise SystemExit(f"Expected exactly one UNUSED_KSYMS_WHITELIST setting, found {len(entries)}")
+          match = re.fullmatch(r'CONFIG_UNUSED_KSYMS_WHITELIST="([^"]+)"', entries[0])
+          if not match:
+              raise SystemExit("Whitelist setting is not a simple quoted path")
+          configured_path = match.group(1)
+          expected_path = "/mnt/disks/build-disk/src/android/common-android13-5.15-2025-05/out/android13-5.15/common/abi_symbollist.raw"
+          if configured_path != expected_path:
+              raise SystemExit(f"Unexpected whitelist path in pinned config: {configured_path}")
+
+          build_config = pathlib.Path("kernel-5.15/build.config.mtk.aarch64").read_text()
+          if not re.search(r'^KMI_SYMBOL_LIST=android/abi_gki_aarch64_mtk$', build_config, re.M):
+              raise SystemExit("Pinned MTK build config does not identify android/abi_gki_aarch64_mtk as its KMI symbol list")
+
+          source = pathlib.Path("kernel-5.15/android/abi_gki_aarch64_mtk")
+          source_lines = source.read_text().splitlines()
+          if not source_lines or source_lines[0].strip() != "[abi_symbol_list]":
+              raise SystemExit("Unexpected format in pinned MTK ABI symbol list")
+          symbols = [line.strip() for line in source_lines[1:] if line.strip() and not line.lstrip().startswith("#")]
+          invalid = [symbol for symbol in symbols if not re.fullmatch(r"[A-Za-z0-9_.$]+", symbol)]
+          if invalid:
+              raise SystemExit(f"Invalid ABI symbol names found: {invalid[:5]}")
+          unique_symbols = list(dict.fromkeys(symbols))
+          if len(unique_symbols) < 1000:
+              raise SystemExit(f"Refusing suspiciously small MTK ABI whitelist: {len(unique_symbols)} symbols")
+
+          raw = ("\n".join(unique_symbols) + "\n").encode()
+          pathlib.Path("abi").mkdir(exist_ok=True)
+          pathlib.Path("abi/abi_symbollist.raw").write_bytes(raw)
+          source_blob = subprocess.check_output(
+              ["git", "-C", "kernel-5.15", "rev-parse", f"{SRC_SHA}:android/abi_gki_aarch64_mtk"],
+              text=True
+          ).strip()
+          report = [
+              "ABI whitelist provenance",
+              f"Source repository: {SRC_REPO}",
+              f"Source commit: {SRC_SHA}",
+              "Source file: android/abi_gki_aarch64_mtk",
+              f"Source Git blob: {source_blob}",
+              f"Source entries (excluding format header): {len(symbols)}",
+              f"Unique symbols materialized: {len(unique_symbols)}",
+              f"Duplicate entries removed: {len(symbols) - len(unique_symbols)}",
+              f"Raw whitelist SHA256: {hashlib.sha256(raw).hexdigest()}",
+              f"Configured absolute path: {configured_path}",
+              "The stock .config was not edited; this file materializes its pinned MTK KMI whitelist at the path it expects.",
+              "",
+          ]
+          pathlib.Path("reports/abi-whitelist-provenance.txt").write_text("\n".join(report))
+          print("\n".join(report))
+          PY
+          whitelist_path="/mnt/disks/build-disk/src/android/common-android13-5.15-2025-05/out/android13-5.15/common/abi_symbollist.raw"
+          sudo install -D -m 0644 abi/abi_symbollist.raw "$whitelist_path"
+          sudo test -s "$whitelist_path"
+          sudo cmp --silent abi/abi_symbollist.raw "$whitelist_path"
+          sha256sum out/.config | tee reports/config-before-build-sha256.txt
+          test "$(sha256sum out/.config | awk '{print $1}')" = "$EXPECTED_CONFIG_SHA256"
+          echo "Pinned MTK ABI whitelist installed and verified at the exact path required by the stock config." | tee -a reports/abi-whitelist-provenance.txt
+
+      - name: Install pinned Android Clang 14.0.7 and LLD 14
+        shell: bash
+        run: |
+          set -euo pipefail
+          tool_dir="${RUNNER_TEMP}/android-llvm"
+          mkdir -p "$tool_dir"
+          git -C "$tool_dir" init -q
+          git -C "$tool_dir" remote add origin \
+            https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86
+          git -C "$tool_dir" -c protocol.version=2 fetch --depth=1 --filter=blob:none \
+            origin "$ANDROID_CLANG_COMMIT"
+          git -C "$tool_dir" sparse-checkout init --cone
+          git -C "$tool_dir" sparse-checkout set clang-r450784e
+          git -C "$tool_dir" checkout --detach FETCH_HEAD
+          test "$(git -C "$tool_dir" rev-parse HEAD)" = "$ANDROID_CLANG_COMMIT"
+          clang_bin="$tool_dir/clang-r450784e/bin"
+          test -x "$clang_bin/clang"
+          test -x "$clang_bin/ld.lld"
+          "$clang_bin/clang" --version | tee reports/clang-version.txt
+          "$clang_bin/ld.lld" --version | tee reports/lld-version.txt
+          grep -Fq 'clang version 14.0.7' reports/clang-version.txt
+          grep -Eq '^LLD 14\.' reports/lld-version.txt
+          echo "$clang_bin" >> "$GITHUB_PATH"
+
+      - name: Integrate KernelSU-Next into the source tree
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Built-in (CONFIG_KSU=y) KernelSU-Next. Uses kprobe hooks, so no manual
+          # source hooks are added; the stock config already has KPROBES=y and EXT4_FS=y.
+          pushd kernel-5.15 >/dev/null
+          git clone -q --depth 1 -b "$KSU_NEXT_TAG" \
+            "https://github.com/$KSU_NEXT_REPO.git" KernelSU-Next
+          ksu_sha="$(git -C KernelSU-Next rev-parse HEAD)"
+          ksu_ver="$(git -C KernelSU-Next describe --tags --always)"
+          # Wire drivers/kernelsu symlink + Makefile + Kconfig (same as setup.sh, pinned).
+          test -d drivers
+          ln -sfn ../KernelSU-Next/kernel drivers/kernelsu
+          grep -q 'kernelsu' drivers/Makefile || printf '\nobj-$(CONFIG_KSU) += kernelsu/\n' >> drivers/Makefile
+          grep -q 'drivers/kernelsu/Kconfig' drivers/Kconfig || sed -i '/^endmenu/i source "drivers/kernelsu/Kconfig"' drivers/Kconfig
+          popd >/dev/null
+          # Turn KSU on in the pinned config.
+          kernel-5.15/scripts/config --file out/.config --enable KSU
+          {
+            echo "KernelSU-Next integration"
+            echo "Repository: $KSU_NEXT_REPO"
+            echo "Pinned tag: $KSU_NEXT_TAG"
+            echo "Resolved version: $ksu_ver"
+            echo "Commit: $ksu_sha"
+            echo "Hook mode: KPROBES (built-in, CONFIG_KSU=y)"
+          } | tee reports/kernelsu-next.txt
+
+      - name: Override full LTO with ThinLTO (deviates from stock config)
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Full-LTO vmlinux.o link gets the 16 GB hosted runner killed even with swap.
+          # ThinLTO keeps CFI working and links in far less memory. This is the ONLY
+          # intentional deviation from the captured stock config.
+          grep -qx 'CONFIG_LTO_CLANG_FULL=y' out/.config
+          kernel-5.15/scripts/config --file out/.config \
+            --disable LTO_CLANG_FULL --enable LTO_CLANG_THIN
+          {
+            echo "Deviation from stock config: CONFIG_LTO_CLANG_FULL -> CONFIG_LTO_CLANG_THIN"
+            grep -E '^(# )?CONFIG_LTO' out/.config
+          } | tee reports/config-deviations.txt
+
+      - name: Reconcile configuration against the pinned source Kconfig
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp out/.config reports/config-before-olddefconfig.txt
+          make -C kernel-5.15 O="$GITHUB_WORKSPACE/out" \
+            ARCH=arm64 LLVM=1 LLVM_IAS=1 CROSS_COMPILE=aarch64-linux-gnu- \
+            olddefconfig 2>&1 | tee reports/olddefconfig.log
+          diff -u reports/config-before-olddefconfig.txt out/.config \
+            > reports/config-olddefconfig.diff || true
+          cp out/.config reports/config-after-olddefconfig.txt
+          sha256sum out/.config | tee reports/config-after-sha256.txt
+          grep -qx 'CONFIG_MODULES=y' out/.config
+          grep -qx 'CONFIG_CC_IS_CLANG=y' out/.config
+          grep -qx 'CONFIG_LTO_CLANG_THIN=y' out/.config
+          grep -qx 'CONFIG_CFI_CLANG=y' out/.config
+          grep -qx 'CONFIG_KSU=y' out/.config
+
+      - name: Add swap for the full-LTO vmlinux link
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The stock config uses CONFIG_LTO_CLANG_FULL + DEBUG_INFO/BTF; the single
+          # vmlinux.o LTO link exceeds the runner's 16 GB RAM and gets the VM killed.
+          sudo swapoff -a || true
+          sudo rm -f /mnt/swapfile /swapfile
+          sudo fallocate -l 40G /swapfile
+          sudo chmod 600 /swapfile
+          sudo mkswap /swapfile
+          sudo swapon /swapfile
+          sudo sysctl -w vm.swappiness=100
+          { free -h; swapon --show; df -h /; } | tee reports/swap.txt
+
+      - name: Compile stock Image.gz with bounded memory use
+        shell: bash
+        run: |
+          set -euo pipefail
+          LINKER='ld.lld --threads=1'
+          {
+            echo "Build start: $(date -u)"
+            echo "Build target: Image.gz only"
+            echo "Parallel jobs: 2"
+            echo "Linker: $LINKER"
+            free -h
+            df -h "$GITHUB_WORKSPACE"
+          } | tee reports/build-start.txt
+
+          (
+            while true; do
+              {
+                echo "===== $(date -u) ====="
+                free -m
+                df -h "$GITHUB_WORKSPACE"
+                ps -eo pid,comm,rss,etime --sort=-rss | sed -n '1,12p'
+                if [ -r /sys/fs/cgroup/memory.events ]; then
+                  cat /sys/fs/cgroup/memory.events
+                fi
+              } >> reports/resource-heartbeat.log 2>&1
+              sleep 120
+            done
+          ) &
+          watch_pid=$!
+
+          set +e
+          timeout -s TERM -k 30s 330m \
+            make -C kernel-5.15 O="$GITHUB_WORKSPACE/out" \
+              ARCH=arm64 LLVM=1 LLVM_IAS=1 CROSS_COMPILE=aarch64-linux-gnu- \
+              LD="$LINKER" -j2 Image.gz 2>&1 | tee reports/build.log
+          build_rc=${PIPESTATUS[0]}
+          set -e
+
+          kill "$watch_pid" 2>/dev/null || true
+          wait "$watch_pid" 2>/dev/null || true
+          {
+            echo "Image.gz compile exit status: $build_rc"
+            echo "Build end: $(date -u)"
+            free -h
+            df -h "$GITHUB_WORKSPACE"
+          } 2>&1 | tee reports/build-summary.txt
+          if [ "$build_rc" -ne 0 ]; then
+            if [ "$build_rc" -eq 124 ]; then
+              echo "Build exceeded the 330-minute command limit." | tee -a reports/build-summary.txt
+            fi
+            exit "$build_rc"
+          fi
+          test -s out/arch/arm64/boot/Image.gz
+          sha256sum out/arch/arm64/boot/Image.gz | tee reports/Image.gz.sha256
+          make -s -C kernel-5.15 O="$GITHUB_WORKSPACE/out" \
+            ARCH=arm64 LLVM=1 LLVM_IAS=1 kernelrelease | tee reports/kernelrelease.txt
+
+      - name: Build SUSFS loadable module against this kernel (experimental)
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          susfs_dir="$GITHUB_WORKSPACE/kernel-5.15/KernelSU-Next/kernel/susfs"
+          test -f "$susfs_dir/Makefile"
+          make -C kernel-5.15 O="$GITHUB_WORKSPACE/out" \
+            ARCH=arm64 LLVM=1 LLVM_IAS=1 CROSS_COMPILE=aarch64-linux-gnu- \
+            M="$susfs_dir" -j2 modules 2>&1 | tee reports/susfs-lkm-build.log
+          ko="$(find "$susfs_dir" -name 'susfs_guard_lkm.ko' | head -n1)"
+          test -n "$ko"
+          mkdir -p out/ksu-modules
+          cp "$ko" out/ksu-modules/
+          sha256sum out/ksu-modules/*.ko | tee reports/susfs-lkm.sha256
+          modinfo out/ksu-modules/susfs_guard_lkm.ko | tee reports/susfs-lkm-modinfo.txt || true
+
+      - name: Upload compile artifact and provenance reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: NEVADA-KSU-IMAGE-DO-NOT-FLASH
+          path: |
+            reports/
+            out/arch/arm64/boot/Image.gz
+            out/.config
+            out/Module.symvers
+            out/System.map
+            out/include/config/kernel.release
+            out/ksu-modules/
+          include-hidden-files: true
+          if-no-files-found: warn
+          retention-days: 14
