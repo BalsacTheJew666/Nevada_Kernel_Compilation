@@ -19,7 +19,7 @@ jobs:
     name: Compile Motorola stock kernel image
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-24.04
-    timeout-minutes: 300
+    timeout-minutes: 355
     permissions:
       contents: read
     env:
@@ -276,6 +276,21 @@ jobs:
           grep -qx 'CONFIG_MODULES=y' out/.config
           grep -qx 'CONFIG_CC_IS_CLANG=y' out/.config
 
+      - name: Add swap for the full-LTO vmlinux link
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The stock config uses CONFIG_LTO_CLANG_FULL + DEBUG_INFO/BTF; the single
+          # vmlinux.o LTO link exceeds the runner's 16 GB RAM and gets the VM killed.
+          sudo swapoff -a || true
+          sudo rm -f /mnt/swapfile /swapfile
+          sudo fallocate -l 40G /swapfile
+          sudo chmod 600 /swapfile
+          sudo mkswap /swapfile
+          sudo swapon /swapfile
+          sudo sysctl -w vm.swappiness=100
+          { free -h; swapon --show; df -h /; } | tee reports/swap.txt
+
       - name: Compile stock Image.gz with bounded memory use
         shell: bash
         run: |
@@ -307,7 +322,7 @@ jobs:
           watch_pid=$!
 
           set +e
-          timeout -s TERM -k 30s 180m \
+          timeout -s TERM -k 30s 330m \
             make -C kernel-5.15 O="$GITHUB_WORKSPACE/out" \
               ARCH=arm64 LLVM=1 LLVM_IAS=1 CROSS_COMPILE=aarch64-linux-gnu- \
               LD="$LINKER" -j2 Image.gz 2>&1 | tee reports/build.log
@@ -324,7 +339,7 @@ jobs:
           } 2>&1 | tee reports/build-summary.txt
           if [ "$build_rc" -ne 0 ]; then
             if [ "$build_rc" -eq 124 ]; then
-              echo "Build exceeded the 180-minute command limit." | tee -a reports/build-summary.txt
+              echo "Build exceeded the 330-minute command limit." | tee -a reports/build-summary.txt
             fi
             exit "$build_rc"
           fi
