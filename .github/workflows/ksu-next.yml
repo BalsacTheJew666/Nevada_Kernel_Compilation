@@ -29,6 +29,9 @@ jobs:
       ANDROID_CLANG_COMMIT: 56fc36f789871f93ae5c6c038c76e5bf10b5d9a6
       KSU_NEXT_REPO: KernelSU-Next/KernelSU-Next
       KSU_NEXT_TAG: v3.4.2
+      STOCK_KERNELRELEASE: 5.15.180-android13-8-00018-g9b2308ac0ad6-ab14563692
+      MAGISK_TAG: v31.1
+      MAGISK_APK_SHA256: 89cefac0a318afa39fb3880c45c87b036c05bc1ebf02a7a715b7f8d7c26ac6e7
     steps:
       - name: Checkout build definitions
         uses: actions/checkout@v4
@@ -288,6 +291,19 @@ jobs:
             echo "Hook mode: KPROBES (built-in, CONFIG_KSU=y)"
           } | tee reports/kernelsu-next.txt
 
+      - name: Pin kernel release string to the stock firmware's
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Without this the tree reports 5.15.180-g0fa176ca7f56-dirty (our KSU wiring
+          # makes git dirty). Root-detection apps and some tools compare uname -r.
+          f=kernel-5.15/scripts/setlocalversion
+          suffix="${STOCK_KERNELRELEASE#5.15.180}"
+          test "$(tail -n1 "$f")" = 'echo "$res"'
+          sed -i '$ s|^echo "\$res"$|echo "'"$suffix"'"|' "$f"
+          tail -n1 "$f" | tee reports/localversion-pin.txt
+          grep -qF "echo \"$suffix\"" "$f"
+
       - name: Override full LTO with ThinLTO (deviates from stock config)
         shell: bash
         run: |
@@ -392,6 +408,51 @@ jobs:
           sha256sum out/arch/arm64/boot/Image.gz | tee reports/Image.gz.sha256
           make -s -C kernel-5.15 O="$GITHUB_WORKSPACE/out" \
             ARCH=arm64 LLVM=1 LLVM_IAS=1 kernelrelease | tee reports/kernelrelease.txt
+          test "$(cat reports/kernelrelease.txt)" = "$STOCK_KERNELRELEASE"
+
+      - name: Check exported-symbol CRCs against stock vendor-module requirements
+        shell: bash
+        env:
+          PRIVATE_REPO_TOKEN: ${{ secrets.PRIVATE_REPO_TOKEN }}
+        run: |
+          set -euo pipefail
+          test -s out/vmlinux.symvers
+          mkdir -p kmi
+          for f in nevada-kmi-required-crcs.json nevada-kmi-v3-additional-required-crcs.json; do
+            curl -fsSL -H "Authorization: Bearer $PRIVATE_REPO_TOKEN" \
+              -H "Accept: application/vnd.github.raw" \
+              "https://api.github.com/repos/$CONFIG_REPO/contents/ci/kmi/$f" -o "kmi/$f"
+          done
+          python3 - <<'PY'
+          import json, pathlib
+          req = {}
+          for f in ("nevada-kmi-required-crcs.json", "nevada-kmi-v3-additional-required-crcs.json"):
+              req.update(json.loads(pathlib.Path("kmi", f).read_text()))
+          built = {}
+          for line in pathlib.Path("out/vmlinux.symvers").read_text().splitlines():
+              parts = line.split("\t")
+              if len(parts) >= 2:
+                  built[parts[1]] = int(parts[0], 16)
+          missing, bad, ok = [], [], 0
+          for sym, crc in sorted(req.items()):
+              want = int(crc, 16)
+              if sym not in built:
+                  missing.append(sym)
+              elif built[sym] != want:
+                  bad.append(f"{sym}: stock {want:#010x} built {built[sym]:#010x}")
+              else:
+                  ok += 1
+          lines = [f"Stock-required symbols checked: {len(req)}",
+                   f"Matching CRCs: {ok}",
+                   f"Missing from vmlinux exports: {len(missing)}",
+                   f"CRC mismatches: {len(bad)}"]
+          lines += ["MISSING " + m for m in missing] + ["MISMATCH " + b for b in bad]
+          lines.append("KMI CRC CHECK: " + ("PASS" if not missing and not bad else "FAIL"))
+          pathlib.Path("reports/kmi-crc-check.txt").write_text("\n".join(lines) + "\n")
+          print("\n".join(lines))
+          if missing or bad:
+              raise SystemExit(1)
+          PY
 
       - name: Build SUSFS loadable module against this kernel (experimental)
         continue-on-error: true
@@ -402,13 +463,56 @@ jobs:
           test -f "$susfs_dir/Makefile"
           make -C kernel-5.15 O="$GITHUB_WORKSPACE/out" \
             ARCH=arm64 LLVM=1 LLVM_IAS=1 CROSS_COMPILE=aarch64-linux-gnu- \
+            modules_prepare 2>&1 | tee reports/modules-prepare.log
+          test -s out/scripts/module.lds
+          test -s out/vmlinux.symvers
+          [ -s out/Module.symvers ] || cp out/vmlinux.symvers out/Module.symvers
+          make -C kernel-5.15 O="$GITHUB_WORKSPACE/out" \
+            ARCH=arm64 LLVM=1 LLVM_IAS=1 CROSS_COMPILE=aarch64-linux-gnu- \
+            KBUILD_EXTRA_SYMBOLS="$GITHUB_WORKSPACE/out/vmlinux.symvers" \
             M="$susfs_dir" -j2 modules 2>&1 | tee reports/susfs-lkm-build.log
           ko="$(find "$susfs_dir" -name 'susfs_guard_lkm.ko' | head -n1)"
           test -n "$ko"
           mkdir -p out/ksu-modules
           cp "$ko" out/ksu-modules/
           sha256sum out/ksu-modules/*.ko | tee reports/susfs-lkm.sha256
-          modinfo out/ksu-modules/susfs_guard_lkm.ko | tee reports/susfs-lkm-modinfo.txt || true
+          strings out/ksu-modules/susfs_guard_lkm.ko | grep '^vermagic=' | tee reports/susfs-lkm-vermagic.txt
+
+      - name: Repack into the stock boot.img with magiskboot (if stock boot.img is provided)
+        shell: bash
+        env:
+          PRIVATE_REPO_TOKEN: ${{ secrets.PRIVATE_REPO_TOKEN }}
+        run: |
+          set -euo pipefail
+          mkdir -p repack
+          code="$(curl -sS -o repack/stock-boot.img -w '%{http_code}' \
+            -H "Authorization: Bearer $PRIVATE_REPO_TOKEN" -H "Accept: application/vnd.github.raw" \
+            "https://api.github.com/repos/$CONFIG_REPO/contents/boot/stock-boot.img")"
+          if [ "$code" != "200" ]; then
+            echo "::notice::No boot/stock-boot.img in $CONFIG_REPO (HTTP $code); repack skipped."
+            echo "Repack skipped: stock boot.img not provided (HTTP $code)." | tee reports/repack.txt
+            rm -f repack/stock-boot.img
+            exit 0
+          fi
+          curl -fsSL -o repack/magisk.apk \
+            "https://github.com/topjohnwu/Magisk/releases/download/$MAGISK_TAG/Magisk-$MAGISK_TAG.apk"
+          echo "$MAGISK_APK_SHA256  repack/magisk.apk" | sha256sum -c -
+          unzip -p repack/magisk.apk lib/x86_64/libmagiskboot.so > repack/magiskboot
+          chmod +x repack/magiskboot
+          cd repack
+          ./magiskboot unpack stock-boot.img 2>&1 | tee ../reports/magiskboot-unpack.txt
+          test -f kernel
+          strings kernel | grep -m1 'Linux version' | tee ../reports/stock-boot-kernel-version.txt || true
+          cp ../out/arch/arm64/boot/Image kernel
+          ./magiskboot repack stock-boot.img boot-ksu-next.img 2>&1 | tee ../reports/magiskboot-repack.txt
+          test -s boot-ksu-next.img
+          {
+            sha256sum stock-boot.img boot-ksu-next.img
+            echo "Stock boot.img size: $(stat -c%s stock-boot.img)"
+            echo "Repacked size:       $(stat -c%s boot-ksu-next.img)"
+            echo "FLASH STATUS: NOT APPROVED. Test with fastboot boot first, keep stock boot.img to restore."
+          } | tee ../reports/repack.txt
+          rm -f stock-boot.img magisk.apk magiskboot
 
       - name: Upload compile artifact and provenance reports
         if: always()
@@ -423,6 +527,8 @@ jobs:
             out/System.map
             out/include/config/kernel.release
             out/ksu-modules/
+            out/vmlinux.symvers
+            repack/boot-ksu-next.img
           include-hidden-files: true
           if-no-files-found: warn
           retention-days: 14
