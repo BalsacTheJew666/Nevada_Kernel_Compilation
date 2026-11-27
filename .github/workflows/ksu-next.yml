@@ -1,6 +1,8 @@
 name: Nevada KernelSU-Next + SUSFS kernel build
 
 on:
+  push:
+    branches: [feat/ksu-next]
   workflow_dispatch:
 
 permissions:
