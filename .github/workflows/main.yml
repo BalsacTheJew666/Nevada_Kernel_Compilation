@@ -19,7 +19,7 @@ jobs:
     name: Compile Motorola stock kernel image
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-24.04
-    timeout-minutes: 300
+    timeout-minutes: 355
     permissions:
       contents: read
     env:
@@ -163,7 +163,7 @@ jobs:
           grep -q '^SUBLEVEL = 180$' kernel-5.15/Makefile
           git -C kernel-5.15 status --short
 
-      - name: Materialize pinned MTK ABI whitelist for stock config
+      - name: Materialize pinned GKI ABI whitelist for stock config
         shell: bash
         run: |
           set -euo pipefail
@@ -189,41 +189,50 @@ jobs:
           if configured_path != expected_path:
               raise SystemExit(f"Unexpected whitelist path in pinned config: {configured_path}")
 
-          build_config = pathlib.Path("kernel-5.15/build.config.mtk.aarch64").read_text()
-          if not re.search(r'^KMI_SYMBOL_LIST=android/abi_gki_aarch64_mtk$', build_config, re.M):
-              raise SystemExit("Pinned MTK build config does not identify android/abi_gki_aarch64_mtk as its KMI symbol list")
+          # The device runs Google's GKI build (ab14563692), whose whitelist is built from
+          # build.config.gki.aarch64: KMI_SYMBOL_LIST plus every ADDITIONAL_KMI_SYMBOL_LISTS
+          # entry. Using only abi_gki_aarch64_mtk trims exports stock vendor modules need.
+          gki_config = pathlib.Path("kernel-5.15/build.config.gki.aarch64").read_text()
+          main_list = re.search(r'^KMI_SYMBOL_LIST=(\S+)$', gki_config, re.M)
+          extra = re.search(r'^ADDITIONAL_KMI_SYMBOL_LISTS="([^"]*)"', gki_config, re.M)
+          if not main_list or not extra:
+              raise SystemExit("build.config.gki.aarch64 lacks KMI_SYMBOL_LIST or ADDITIONAL_KMI_SYMBOL_LISTS")
+          list_files = [main_list.group(1)] + extra.group(1).split()
+          if "android/abi_gki_aarch64_mtk" not in list_files:
+              raise SystemExit("GKI symbol lists unexpectedly omit android/abi_gki_aarch64_mtk")
 
-          source = pathlib.Path("kernel-5.15/android/abi_gki_aarch64_mtk")
-          source_lines = source.read_text().splitlines()
-          if not source_lines or source_lines[0].strip() != "[abi_symbol_list]":
-              raise SystemExit("Unexpected format in pinned MTK ABI symbol list")
-          symbols = [line.strip() for line in source_lines[1:] if line.strip() and not line.lstrip().startswith("#")]
+          symbols = []
+          blobs = []
+          for rel in list_files:
+              for line in pathlib.Path("kernel-5.15", rel).read_text().splitlines():
+                  text = line.strip()
+                  if not text or text.startswith("#") or text.startswith("["):
+                      continue
+                  symbols.append(text.split()[0])
+              blob = subprocess.check_output(["git", "-C", "kernel-5.15", "rev-parse", f"{SRC_SHA}:{rel}"], text=True).strip()
+              blobs.append(f"  {rel} {blob}")
           invalid = [symbol for symbol in symbols if not re.fullmatch(r"[A-Za-z0-9_.$]+", symbol)]
           if invalid:
               raise SystemExit(f"Invalid ABI symbol names found: {invalid[:5]}")
-          unique_symbols = list(dict.fromkeys(symbols))
-          if len(unique_symbols) < 1000:
-              raise SystemExit(f"Refusing suspiciously small MTK ABI whitelist: {len(unique_symbols)} symbols")
+          unique_symbols = sorted(set(symbols))
+          if len(unique_symbols) < 5000:
+              raise SystemExit(f"Refusing suspiciously small GKI ABI whitelist: {len(unique_symbols)} symbols")
 
           raw = ("\n".join(unique_symbols) + "\n").encode()
           pathlib.Path("abi").mkdir(exist_ok=True)
           pathlib.Path("abi/abi_symbollist.raw").write_bytes(raw)
-          source_blob = subprocess.check_output(
-              ["git", "-C", "kernel-5.15", "rev-parse", f"{SRC_SHA}:android/abi_gki_aarch64_mtk"],
-              text=True
-          ).strip()
           report = [
               "ABI whitelist provenance",
               f"Source repository: {SRC_REPO}",
               f"Source commit: {SRC_SHA}",
-              "Source file: android/abi_gki_aarch64_mtk",
-              f"Source Git blob: {source_blob}",
-              f"Source entries (excluding format header): {len(symbols)}",
+              "Source: build.config.gki.aarch64 KMI_SYMBOL_LIST + ADDITIONAL_KMI_SYMBOL_LISTS (union, as the GKI build does)",
+              f"Lists used ({len(list_files)}):",
+              *blobs,
+              f"Source entries: {len(symbols)}",
               f"Unique symbols materialized: {len(unique_symbols)}",
-              f"Duplicate entries removed: {len(symbols) - len(unique_symbols)}",
               f"Raw whitelist SHA256: {hashlib.sha256(raw).hexdigest()}",
               f"Configured absolute path: {configured_path}",
-              "The stock .config was not edited; this file materializes its pinned MTK KMI whitelist at the path it expects.",
+              "The stock .config was not edited; this file materializes the GKI KMI whitelist at the path it expects.",
               "",
           ]
           pathlib.Path("reports/abi-whitelist-provenance.txt").write_text("\n".join(report))
@@ -235,7 +244,7 @@ jobs:
           sudo cmp --silent abi/abi_symbollist.raw "$whitelist_path"
           sha256sum out/.config | tee reports/config-before-build-sha256.txt
           test "$(sha256sum out/.config | awk '{print $1}')" = "$EXPECTED_CONFIG_SHA256"
-          echo "Pinned MTK ABI whitelist installed and verified at the exact path required by the stock config." | tee -a reports/abi-whitelist-provenance.txt
+          echo "Pinned GKI ABI whitelist installed and verified at the exact path required by the stock config." | tee -a reports/abi-whitelist-provenance.txt
 
       - name: Install pinned Android Clang 14.0.7 and LLD 14
         shell: bash
@@ -261,6 +270,21 @@ jobs:
           grep -Eq '^LLD 14\.' reports/lld-version.txt
           echo "$clang_bin" >> "$GITHUB_PATH"
 
+      - name: Override full LTO with ThinLTO (deviates from stock config)
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Full-LTO vmlinux.o link gets the 16 GB hosted runner killed even with swap.
+          # ThinLTO keeps CFI working and links in far less memory. This is the ONLY
+          # intentional deviation from the captured stock config.
+          grep -qx 'CONFIG_LTO_CLANG_FULL=y' out/.config
+          kernel-5.15/scripts/config --file out/.config \
+            --disable LTO_CLANG_FULL --enable LTO_CLANG_THIN
+          {
+            echo "Deviation from stock config: CONFIG_LTO_CLANG_FULL -> CONFIG_LTO_CLANG_THIN"
+            grep -E '^(# )?CONFIG_LTO' out/.config
+          } | tee reports/config-deviations.txt
+
       - name: Reconcile configuration against the pinned source Kconfig
         shell: bash
         run: |
@@ -275,6 +299,23 @@ jobs:
           sha256sum out/.config | tee reports/config-after-sha256.txt
           grep -qx 'CONFIG_MODULES=y' out/.config
           grep -qx 'CONFIG_CC_IS_CLANG=y' out/.config
+          grep -qx 'CONFIG_LTO_CLANG_THIN=y' out/.config
+          grep -qx 'CONFIG_CFI_CLANG=y' out/.config
+
+      - name: Add swap for the full-LTO vmlinux link
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The stock config uses CONFIG_LTO_CLANG_FULL + DEBUG_INFO/BTF; the single
+          # vmlinux.o LTO link exceeds the runner's 16 GB RAM and gets the VM killed.
+          sudo swapoff -a || true
+          sudo rm -f /mnt/swapfile /swapfile
+          sudo fallocate -l 40G /swapfile
+          sudo chmod 600 /swapfile
+          sudo mkswap /swapfile
+          sudo swapon /swapfile
+          sudo sysctl -w vm.swappiness=100
+          { free -h; swapon --show; df -h /; } | tee reports/swap.txt
 
       - name: Compile stock Image.gz with bounded memory use
         shell: bash
@@ -307,7 +348,7 @@ jobs:
           watch_pid=$!
 
           set +e
-          timeout -s TERM -k 30s 180m \
+          timeout -s TERM -k 30s 330m \
             make -C kernel-5.15 O="$GITHUB_WORKSPACE/out" \
               ARCH=arm64 LLVM=1 LLVM_IAS=1 CROSS_COMPILE=aarch64-linux-gnu- \
               LD="$LINKER" -j2 Image.gz 2>&1 | tee reports/build.log
@@ -324,7 +365,7 @@ jobs:
           } 2>&1 | tee reports/build-summary.txt
           if [ "$build_rc" -ne 0 ]; then
             if [ "$build_rc" -eq 124 ]; then
-              echo "Build exceeded the 180-minute command limit." | tee -a reports/build-summary.txt
+              echo "Build exceeded the 330-minute command limit." | tee -a reports/build-summary.txt
             fi
             exit "$build_rc"
           fi
