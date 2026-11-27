@@ -261,6 +261,21 @@ jobs:
           grep -Eq '^LLD 14\.' reports/lld-version.txt
           echo "$clang_bin" >> "$GITHUB_PATH"
 
+      - name: Override full LTO with ThinLTO (deviates from stock config)
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Full-LTO vmlinux.o link gets the 16 GB hosted runner killed even with swap.
+          # ThinLTO keeps CFI working and links in far less memory. This is the ONLY
+          # intentional deviation from the captured stock config.
+          grep -qx 'CONFIG_LTO_CLANG_FULL=y' out/.config
+          kernel-5.15/scripts/config --file out/.config \
+            --disable LTO_CLANG_FULL --enable LTO_CLANG_THIN
+          {
+            echo "Deviation from stock config: CONFIG_LTO_CLANG_FULL -> CONFIG_LTO_CLANG_THIN"
+            grep -E '^(# )?CONFIG_LTO' out/.config
+          } | tee reports/config-deviations.txt
+
       - name: Reconcile configuration against the pinned source Kconfig
         shell: bash
         run: |
@@ -275,6 +290,8 @@ jobs:
           sha256sum out/.config | tee reports/config-after-sha256.txt
           grep -qx 'CONFIG_MODULES=y' out/.config
           grep -qx 'CONFIG_CC_IS_CLANG=y' out/.config
+          grep -qx 'CONFIG_LTO_CLANG_THIN=y' out/.config
+          grep -qx 'CONFIG_CFI_CLANG=y' out/.config
 
       - name: Add swap for the full-LTO vmlinux link
         shell: bash
